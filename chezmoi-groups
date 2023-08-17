@@ -1,0 +1,432 @@
+#!/usr/bin/python
+# vim: fileencoding=utf-8
+
+"""Here be dragons."""
+
+import os
+import shutil
+import sys
+
+CMD = 'chezmoi-bin'
+if shutil.which(CMD) is None:
+    CMD = 'chezmoi'
+
+KNOWN_SUBCMDS = (
+    'add',
+    'apply',
+    'archive',
+    'cat',
+    'chattr',
+    'diff',
+    'dump',
+    'edit',
+    'forget',
+    #'init',  # only with --apply
+    'ignored',
+    'managed',
+    'merge',
+    'merge-all',
+    'remove',
+    're-add',
+    'source-path',  # only with argument
+    'status',
+    'update',
+    'verify',
+)
+SUBCMD_ALIAS = {
+    'add': 'manage',
+    'forget': 'unmanage',
+    'managed': 'list',
+    'remove': 'rm'
+}
+
+# If .chezmoiignore files don't affect the (sub)command, just 'exec' chezmoi.
+if __name__ == '__main__':
+    sys.argv[0] = 'chezmoi'
+    if len(sys.argv) < 2 or (sys.argv[1] not in KNOWN_SUBCMDS and
+                             sys.argv[1] not in SUBCMD_ALIAS.values()):
+        os.execvp(CMD, sys.argv)
+
+
+import argparse
+import bisect
+import glob
+import json
+import os.path
+import re
+from itertools import filterfalse
+from pathlib import Path, PurePath
+from subprocess import run
+
+
+## Definitions ##
+
+CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config'))
+GROUPS_FILE = os.path.join(CONFIG_HOME, 'chezmoi', 'chezmoigroups.txt')
+CHEZMOI_IGNORE_FILE = '.chezmoiignore'
+GROUPS_IGNORE_FILE = CHEZMOI_IGNORE_FILE + '.groups'
+
+CMD_GET_DATA = 'data --format json'
+CMD_LIST_ALL = 'managed --path-style relative --include all'  # --exclude dirs?
+CMD_LIST_DIRS = CMD_LIST_ALL.replace('all', 'dirs')
+CMD_LIST_IGNORED = 'ignored'
+
+NOGROUP = '<NOGROUP>'
+
+
+## Chezmoi interaction ##
+
+def main():
+    # Main parser.
+    main_parser = argparse.ArgumentParser(
+        "chezmoig",
+        description="Manage chezmoi files in groups.",
+        allow_abbrev=False,
+    )
+
+    # Subcommand parsers.
+    parser = {}
+    subparsers = main_parser.add_subparsers(dest='subcmd')
+    for subcmd in KNOWN_SUBCMDS:
+        aliases = (a,) if (a := SUBCMD_ALIAS.get(subcmd)) else ()
+        parser[subcmd] = subparsers.add_parser(subcmd, aliases=aliases)
+        parser[subcmd].set_defaults(func=update_chezmoiignore)
+
+    # Options
+    parser['add'].add_argument("-g", "--group")
+
+    # Run chezmoi-groups
+    args, chezmoi_args = main_parser.parse_known_args()
+    args.func()
+
+    # Add home path prefix to filename
+    if chezmoi_args:
+        dotfile = Path.home() / chezmoi_args[-1]
+        if dotfile.exists():
+            chezmoi_args[-1] = dotfile.as_posix()
+
+    # Finally execute the chezmoi command
+    os.execlp(CMD, sys.argv[0], args.subcmd, *chezmoi_args)
+
+
+def update_chezmoiignore():
+    chezmoi, selected_groups = _get_chezmoi_data()
+    groups_file = os.path.join(chezmoi['sourceDir'], GROUPS_FILE)
+    ignore_file = os.path.join(chezmoi['sourceDir'], GROUPS_IGNORE_FILE)
+
+    groups = _read_groups_file(groups_file)
+    managed_files, managed_dirs = _get_managed_files()
+
+    # Files not pertaining to any group.
+    groups[NOGROUP] = _inverse_match(groups, managed_files, managed_dirs)
+    selected_groups.append(NOGROUP)
+
+    if not any(groups):
+        _write_ignore_groups(ignore_file, ())
+        return
+
+    selected_groups = {k: v for k, v in groups.items() if k in selected_groups}
+    ignored_files = _inverse_match(selected_groups, managed_files, managed_dirs)
+    _write_ignore_groups(ignore_file, ignored_files)
+
+    # Test
+    #import pprint
+    #selected_files = managed_files - ignored_files
+    #print(">>> Selected <<<")
+    #pprint(sorted(str(f) for f in selected_files))
+    #print("\n>>> Ignored <<<")
+    #pprint(sorted(str(f) for f in ignored_files))
+
+
+def _chezmoi_command(args, disable_chezmoig=False):
+    """Capture the output of a chezmoi command."""
+    cmd = [CMD] + args.split(' ')
+    env = dict(os.environ, CHEZMOIG_DISABLE='true') if disable_chezmoig else None
+    proc = run(cmd, env=env, check=True, capture_output=True, text=True)
+    return proc.stdout.rstrip('\n')
+
+
+def _get_chezmoi_data():
+    """Read the chezmoi computed data."""
+    data = json.loads(_chezmoi_command(CMD_GET_DATA))
+    return data['chezmoi'], data['groups']
+
+
+def _read_groups_file(pathname):
+    """Read the file groups specification from source state."""
+    HEADER_REGEX = re.compile(r'}}\s*(\w+)\s*{{')
+    groups = {}
+    current_group = None
+
+    with open(pathname) as file:
+        for line in file.readlines():
+            if line == '\n' or line.startswith('#'):
+                continue
+            line = line.rstrip('\n')
+            if match := HEADER_REGEX.fullmatch(line):
+                current_group = match.group(1)
+                groups[current_group] = []
+            elif current_group is None:
+                raise Exception("entry before first header or bad header: \"%s\"" % line)
+            else:
+                groups[current_group].append(line)
+    return groups
+
+
+def _get_managed_files():
+    """Get list of files managed by chezmoi as 'PurePath's."""
+    # Don't include the chezmoig-generated ignore file when running
+    # these commands.
+    files = _chezmoi_command(CMD_LIST_ALL, disable_chezmoig=True).split('\n')
+    #files += _chezmoi_command(CMD_LIST_IGNORED, disable_chezmoig=True).split('\n')
+    dirs = _chezmoi_command(CMD_LIST_DIRS, disable_chezmoig=True).split('\n')
+    return {PurePath(f) for f in files}, {PurePath(d) for d in dirs}
+
+
+def _inverse_match(group_patterns, files, dirs):
+    """
+    Match a set of patterns from groups against a list of files and
+    return the complement of the matching sublist.
+    """
+    raw_patterns = {p for pats in group_patterns.values() for p in pats}
+
+    # Check, translate and expand "ignore" patterns to glob patterns.
+    expanded_patterns = set()
+    for pat in raw_patterns:
+        pat = _translate_from_doublestar(pat)
+        pats = expand_braces(pat)
+        expanded_patterns.update(pats)
+
+    # Match against list of files.
+    ignored_files = files.copy()
+    for pat in expanded_patterns:
+        if '*' not in pat and '?' not in pat and '[' not in pat:
+            ignored_files.discard(PurePath(pat))
+        elif '**' not in pat:
+            matches = tuple(f for f in files if f.match(pat))
+            ignored_files.difference_update(matches)
+        else:
+            # double star hack
+            pat_prefix, _, pat_suffix = pat.partition('**/')
+            pat_prefix = pat_prefix.rstrip('/')
+            for f in tuple(ignored_files):
+                prefix_level = pat_prefix.count('/') + 2
+                try:
+                    if f.match(pat_suffix) and (
+                            not pat_prefix or (
+                                len(f.parts) >= prefix_level + pat_suffix.count('/')
+                                and f.parents[-prefix_level].match(pat_prefix)
+                            )):
+                        ignored_files.remove(f)
+                except Exception as e:
+                    raise Exception(f"{f=}, {pat_prefix=!r} {pat_suffix=!r}, {len(f.parts)=}") from e
+
+    # Don't ignore directories with included files.
+    selected_files = sorted(files - ignored_files)
+    ignored_dirs = dirs & ignored_files
+    for dir in ignored_dirs:
+        i = bisect.bisect(selected_files, dir)
+        try:
+            if selected_files[i].is_relative_to(dir):
+                ignored_files.remove(dir)
+        except IndexError:
+            pass
+
+    return ignored_files
+
+
+def _write_ignore_groups(ignore_file, ignored_files):
+    with open(ignore_file, mode='w') as file:
+        file.write("# Automatically generated by chezmoi-groups. Any changes will be lost!\n")
+        file.write('\n'.join(sorted(str(path) for path in ignored_files)))
+        file.write('\n')
+
+
+## Filename patterns ##
+
+METACHARS = re.compile('[*?[{}]')
+
+def _translate_from_doublestar(pat):
+    """Check if pattern is valid and translate from Go doublestar format to Python glob format."""
+    orig_pat = pat
+    escaped_chars = []
+    opening_braces = []
+
+    if isinstance(pat, PurePath):
+        # For the 'NOGRUP' group
+        return METACHARS.sub(r'[\g<0>]', pat.as_posix())
+
+    if (n := len(pat)) == 0:
+        raise BadPatternError("empty pattern")
+
+    i = 0
+    while i < n:
+        c = pat[i]
+        i += 1
+
+        if c == '\\':
+            # escaped character
+            escaped_chars.append(i)
+            i += 1  # skip next
+
+        elif c == '[':
+            # inside character range
+            if i < n and pat[i] == '^':
+                # match doublestar's behavior
+                pat = pat[:i] + '!' + pat[i+1:]
+            i = _traverse_character_range(orig_pat, n, i)
+
+        elif c == '{':
+            opening_braces.append(i)
+        elif c == '}':
+            try:
+                opening_braces.pop()
+            except IndexError:
+                raise BadPatternError("unmached closing brace", pat=orig_pat, start=i - 1)
+
+    if opening_braces:
+        raise BadPatternError("unmached opening brace", pat=orig_pat, start=opening_braces[-1] - 1)
+
+    # translate escaped characters
+    if escaped_chars:
+        if escaped_chars[-1] == n:
+            raise BadPatternError("escape character at pattern end", pat=orig_pat, start=n - 1)
+
+        parts = [pat[:escaped_chars[0] - 1]]
+        for i, j in zip(escaped_chars, escaped_chars[1:] + [n + 1]):
+            c = pat[i]
+            if METACHARS.match(c):
+                # translate metacharaters to character range
+                parts += ('[', c, ']')
+            else:
+                # translate others to the character itself
+                parts.append(c)
+            parts.append(pat[i+1:j-1])
+        pat = ''.join(parts)
+
+    return pat
+
+
+def expand_braces(pat):
+    """TODO: Find the rightmost, innermost set of braces and, if it contains a
+    comma-separated list, expand its contents recursively (any of its items
+    may itself be a list enclosed in braces).
+
+    Return the full set of expanded strings.
+    """
+    opening_braces = []
+    closing_braces = []
+    alt_separators = []
+    brace_depth = 0
+    recursive = False
+
+    i, n = 0, len(pat)
+    while i < n:
+        c = pat[i]
+
+        if c == '{':
+            if brace_depth == 0:
+                opening_braces.append(i)
+                alt_separators.append([])
+            else:
+                recursive = True
+            brace_depth += 1
+
+        elif c == '}':
+            if brace_depth == 1:
+                closing_braces.append(i)
+            brace_depth -= 1
+
+        elif c == ',' and brace_depth == 1:
+            alt_separators[-1].append(i)
+
+        if c == '[':
+            i = _traverse_character_range(pat, n, i + 1)
+        else:
+            i += 1
+
+    patterns = {pat}
+    if not opening_braces:
+        return patterns
+
+    for start, end, seps in reversed(tuple(zip(opening_braces, closing_braces, alt_separators))):
+        alternatives = (pat[i+1:j] for i, j in zip([start] + seps, seps + [end]))
+        patterns = {p[:start] + alt + p[end+1:] for alt in alternatives for p in patterns}
+
+    if recursive:
+        expanded_patterns = set()
+        for p in patterns:
+            expanded_patterns.update(expand_braces(p))
+        patterns = expanded_patterns
+
+    return patterns
+
+
+def _traverse_character_range(pat, n, i):
+    range_start = i - 1
+    maybe_empty = False
+    if i < n and pat[i] == '!' or pat[i] == '^':
+        i += 1
+    if i < n and pat[i] == ']':
+        i += 1
+        maybe_empty = True
+    try:
+        i = pat.index(']', i)
+    except ValueError:
+        if maybe_empty:
+            err_msg = "empty character range"
+            end = i - 1
+        else:
+            err_msg = "unpaired character range bracket"
+            end = None
+        raise BadPatternError(err_msg, pat=pat, start=range_start, end=end)
+    return i + 1
+
+
+class BadPatternError(ValueError):
+    """Exception that shows where is the error in the glob pattern."""
+    def __init__(self, *args, pat=None, start=None, end=None):
+        super().__init__(*args)
+        self.pat = pat
+        self.start = start
+        self.end = end if end is not None else start
+
+    def __str__(self):
+        if self.args and self.pat is not None:
+            msg = '{}:\n  "{}"'.format(self.args[0], self.pat)
+            if self.start is not None:
+                arrow_len = self.end - self.start + 1
+                msg += '\n   ' + self.start*' ' + arrow_len*'^'
+            self.args = msg, *self.args[1:]
+        return super().__str__()
+
+
+############################################
+#  Reimplementation of iglob() and glob()  #
+############################################
+
+def _iglob(pathname, **kwds):
+    return glob.iglob(pathname, recursive=True, include_hidden=True, **kwds)
+
+
+def doublestar_iglob(pathnames, *, root_dir=None, dir_fd=None):
+    if isinstance(pathnames, str):
+        pathnames = (pathnames,)
+    seen = set()
+
+    for pathname in pathnames:
+        pat = _translate_from_doublestar(pathname)
+        patterns = expand_braces(pat)
+        for pat in patterns:
+            it = _iglob(pat, root_dir=root_dir, dir_fd=dir_fd)
+            for path in filterfalse(seen.__contains__, it):
+                seen.add(path)
+                yield path
+
+
+def doublestar_glob(pathnames, *, root_dir=None, dir_fd=None):
+    return list(doublestar_iglob(pathnames, root_dir=root_dir, dir_fd=dir_fd))
+
+
+if __name__ == '__main__':
+    main()
