@@ -62,7 +62,7 @@ from subprocess import run
 ## Definitions ##
 
 CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config'))
-GROUPS_FILE = os.path.join(CONFIG_HOME, 'chezmoi', 'chezmoigroups.txt')
+GROUPS_FILE = '.chezmoigroups'
 CHEZMOI_IGNORE_FILE = '.chezmoiignore'
 GROUPS_IGNORE_FILE = CHEZMOI_IGNORE_FILE + '.groups'
 
